@@ -686,5 +686,253 @@ never touching the pending queue."
           (should (null (hernes-session-messages hernes-ui--session))))
       (kill-buffer buf))))
 
+;;;; Streaming + thinking (reasoning) display
+
+;;;;; (a) assistant text chunks concatenate into pending-text
+
+(ert-deftest hernes-test-stream-callback-concatenates-chunks ()
+  "`hernes--turn-callback' accumulates streamed string chunks (does not replace).
+The turn starts with an empty pending-text, and two chunks arriving in sequence
+leave their concatenation."
+  (let ((session (hernes--make-session :root default-directory :pending-text "")))
+    (hernes--turn-callback session "Hello, " nil)
+    (hernes--turn-callback session "world" nil)
+    (should (equal (hernes-session-pending-text session) "Hello, world"))))
+
+;;;;; (b) reasoning never enters the conversation context
+
+(ert-deftest hernes-test-stream-reasoning-not-in-messages ()
+  "Reasoning chunks are display-only: they touch neither the message list nor
+pending-text, so they cannot re-enter the context on later turns."
+  (let ((session (hernes--make-session :root default-directory
+                                       :pending-text "" :messages nil)))
+    (hernes--turn-callback session '(reasoning . "let me think ") nil)
+    (hernes--turn-callback session '(reasoning . "about it") nil)
+    (hernes--turn-callback session '(reasoning . t) nil)
+    (should (null (hernes-session-messages session)))
+    (should (equal (hernes-session-pending-text session) ""))))
+
+;;;;; (c) send-request routes chunks to on-stream / reasoning to on-thinking
+
+(ert-deftest hernes-test-send-request-routes-stream-and-reasoning ()
+  "With `gptel-request' stubbed to emit a streamed turn, `hernes--send-request'
+routes text chunks to on-stream and reasoning conses to on-thinking, concatenates
+the text into pending-text, and keeps reasoning out of the messages."
+  (let ((streamed nil) (thought nil))
+    (cl-letf (((symbol-function 'gptel-request)
+               (lambda (_prompt &rest args)
+                 (let ((cb (plist-get args :callback)))
+                   ;; thinking phase, then the answer, then stream success.
+                   (funcall cb '(reasoning . "hmm ") nil)
+                   (funcall cb '(reasoning . t) nil)
+                   (funcall cb "the " nil)
+                   (funcall cb "answer" nil)
+                   (funcall cb t nil))
+                 nil)))
+      (let ((session (hernes--make-session
+                      :root default-directory
+                      :mode 'chat
+                      :backend hernes-backend
+                      :system "sys"
+                      :tools (hernes--all-tools)
+                      :pending-text ""
+                      :messages (list (cons 'prompt "x"))
+                      :on-stream (lambda (c) (push c streamed))
+                      :on-thinking (lambda (c) (push c thought)))))
+        (hernes--send-request session)
+        (should (equal (nreverse streamed) '("the " "answer")))
+        (should (equal (nreverse thought) '("hmm " t)))
+        (should (equal (hernes-session-pending-text session) "the answer"))
+        ;; No reasoning (or streamed text) leaked into the conversation.
+        (should-not (cl-find 'reasoning (hernes-session-messages session)
+                             :key #'car-safe))
+        (should (equal (hernes-session-messages session)
+                       (list (cons 'prompt "x"))))))))
+
+;;;;; (d) headless: no callbacks, chunks are silently ignored
+
+(ert-deftest hernes-test-stream-headless-ignores-chunks ()
+  "With no on-stream/on-thinking (the headless default), streamed text and
+reasoning chunks are accepted without error: text still accumulates, reasoning
+is dropped, and nothing is pushed as a message."
+  (let ((session (hernes--make-session :root default-directory
+                                       :pending-text "" :messages nil)))
+    (hernes--turn-callback session "chunk" nil)
+    (hernes--turn-callback session '(reasoning . "think") nil)
+    (hernes--turn-callback session '(reasoning . t) nil)
+    (should (equal (hernes-session-pending-text session) "chunk"))
+    (should (null (hernes-session-messages session)))))
+
+;;;;; UI: header spinner + no double render of streamed text
+
+(ert-deftest hernes-test-ui-header-shows-running-spinner ()
+  "The header line shows a spinner glyph and an elapsed-seconds counter while
+running, and `idle' otherwise."
+  (with-temp-buffer
+    (hernes-ui-mode)
+    (setq hernes-ui--running t
+          hernes-ui--spinner-start (current-time)
+          hernes-ui--spinner-index 3)
+    (let ((h (hernes-ui--header-string)))
+      (should (string-match-p "running" h))
+      (should (string-match-p "[0-9]+s" h))
+      (should (string-match-p (regexp-quote
+                               (aref hernes-ui--spinner-glyphs 3))
+                              h)))
+    (setq hernes-ui--running nil)
+    (should (string-match-p "idle" (hernes-ui--header-string)))))
+
+(ert-deftest hernes-test-ui-stream-not-double-rendered ()
+  "Assistant text shown live by the on-stream callback is not rendered a second
+time by the on-turn callback (the double-render guard via `stream-active')."
+  (let ((buf (hernes-ui-test--make-input-buffer default-directory "")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let ((on-stream (hernes-ui--on-stream-fn buf))
+                (on-turn (hernes-ui--on-turn-fn buf)))
+            (funcall on-stream "Hello ")
+            (funcall on-stream "there")
+            (funcall on-turn (list :turn 1 :text "Hello there" :results nil)))
+          (let ((transcript (buffer-substring-no-properties
+                             (point-min) hernes-ui--input-marker)))
+            (should (= 1 (hernes-ui-test--count-substr "Hello there" transcript)))))
+      (kill-buffer buf))))
+
+(ert-deftest hernes-test-ui-stream-disabled-renders-once ()
+  "When streaming does not engage (no on-stream fired), the on-turn callback
+still renders the assistant text exactly once (the fallback path)."
+  (let ((buf (hernes-ui-test--make-input-buffer default-directory "")))
+    (unwind-protect
+        (with-current-buffer buf
+          (funcall (hernes-ui--on-turn-fn buf)
+                   (list :turn 1 :text "plain answer" :results nil))
+          (let ((transcript (buffer-substring-no-properties
+                             (point-min) hernes-ui--input-marker)))
+            (should (= 1 (hernes-ui-test--count-substr "plain answer" transcript)))))
+      (kill-buffer buf))))
+
+;;;; Collapsible thinking blocks (hernes-ui.el)
+
+(defun hernes-ui-test--make-thinking-buffer ()
+  "Return a fresh `hernes-ui-mode' buffer with prompt/input markers set up, for
+thinking-block tests.  Mirrors `hernes-ui-test--make-input-buffer' minus a
+root and typed input, since these tests drive `hernes-ui--on-thinking-fn'
+directly and never call `hernes-ui-send'."
+  (let ((buf (generate-new-buffer " *hernes-ui-thinking-test*")))
+    (with-current-buffer buf
+      (hernes-ui-mode)
+      (let ((inhibit-read-only t))
+        (let ((prefix-start (point)))
+          (hernes-ui--insert-ro hernes-ui-prompt nil)
+          (setq hernes-ui--input-marker (copy-marker (point) nil))
+          (setq hernes-ui--prompt-marker (copy-marker prefix-start t))))
+      (goto-char (point-max)))
+    buf))
+
+;;;;; (a) closing a block wraps its body in a togglable-invisible overlay
+
+(ert-deftest hernes-test-ui-thinking-block-overlay-toggles-invisible ()
+  "After a reasoning block closes (`(reasoning . t)'), its body sits under an
+overlay whose `invisible' property can be toggled directly."
+  (let ((buf (hernes-ui-test--make-thinking-buffer)))
+    (unwind-protect
+        (let ((on-thinking (hernes-ui--on-thinking-fn buf))
+              block)
+          (funcall on-thinking "hmm, let me ")
+          (funcall on-thinking "think about it")
+          (with-current-buffer buf (setq block hernes-ui--thinking-open-block))
+          (funcall on-thinking t)
+          (should (overlayp (hernes-ui--thinking-block-overlay block)))
+          (let ((ov (hernes-ui--thinking-block-overlay block)))
+            (overlay-put ov 'invisible nil)
+            (should-not (overlay-get ov 'invisible))
+            (overlay-put ov 'invisible t)
+            (should (overlay-get ov 'invisible))))
+      (kill-buffer buf))))
+
+;;;;; (b) `hernes-ui-thinking-collapse-on-done' governs the initial closed state
+
+(ert-deftest hernes-test-ui-thinking-collapse-on-done-controls-initial-state ()
+  "With the default t, a closed block starts collapsed (overlay invisible,
+`open' nil); with nil it starts still expanded (overlay visible, `open' t)."
+  (let ((buf (hernes-ui-test--make-thinking-buffer)))
+    (unwind-protect
+        (let ((hernes-ui-thinking-collapse-on-done t)
+              (on-thinking (hernes-ui--on-thinking-fn buf))
+              block)
+          (funcall on-thinking "reasoning...")
+          (with-current-buffer buf (setq block hernes-ui--thinking-open-block))
+          (funcall on-thinking t)
+          (should-not (hernes-ui--thinking-block-open block))
+          (should (overlay-get (hernes-ui--thinking-block-overlay block) 'invisible)))
+      (kill-buffer buf)))
+  (let ((buf (hernes-ui-test--make-thinking-buffer)))
+    (unwind-protect
+        (let ((hernes-ui-thinking-collapse-on-done nil)
+              (on-thinking (hernes-ui--on-thinking-fn buf))
+              block)
+          (funcall on-thinking "reasoning...")
+          (with-current-buffer buf (setq block hernes-ui--thinking-open-block))
+          (funcall on-thinking t)
+          (should (hernes-ui--thinking-block-open block))
+          (should-not (overlay-get (hernes-ui--thinking-block-overlay block) 'invisible)))
+      (kill-buffer buf))))
+
+;;;;; (c) the toggle command flips the ▾/▸ glyph and the closed-state summary
+
+(ert-deftest hernes-test-ui-thinking-toggle-updates-glyph-and-summary ()
+  "`hernes-ui-thinking-toggle', run with point on the header line, flips the
+▾/▸ glyph and shows the elapsed-time/char-count summary only while collapsed."
+  (let ((buf (hernes-ui-test--make-thinking-buffer)))
+    (unwind-protect
+        (let ((hernes-ui-thinking-collapse-on-done t)
+              (on-thinking (hernes-ui--on-thinking-fn buf))
+              block)
+          (funcall on-thinking "some reasoning text")
+          (with-current-buffer buf (setq block hernes-ui--thinking-open-block))
+          (funcall on-thinking t)
+          (with-current-buffer buf
+            (should (string-match-p
+                     "▸ thinking ("
+                     (buffer-substring-no-properties
+                      (hernes-ui--thinking-block-header-start block)
+                      (hernes-ui--thinking-block-header-end block))))
+            (goto-char (hernes-ui--thinking-block-header-start block))
+            (hernes-ui-thinking-toggle)
+            (should (hernes-ui--thinking-block-open block))
+            (should (string-match-p
+                     "▾ thinking"
+                     (buffer-substring-no-properties
+                      (hernes-ui--thinking-block-header-start block)
+                      (hernes-ui--thinking-block-header-end block))))
+            (hernes-ui-thinking-toggle)
+            (should-not (hernes-ui--thinking-block-open block))))
+      (kill-buffer buf))))
+
+;;;;; (d) multiple blocks toggle independently
+
+(ert-deftest hernes-test-ui-thinking-multiple-blocks-toggle-independently ()
+  "Two thinking blocks in the same buffer toggle independently: expanding one
+leaves the other's collapsed state untouched."
+  (let ((buf (hernes-ui-test--make-thinking-buffer)))
+    (unwind-protect
+        (let ((hernes-ui-thinking-collapse-on-done t)
+              (on-thinking (hernes-ui--on-thinking-fn buf))
+              block1 block2)
+          (funcall on-thinking "first block reasoning")
+          (with-current-buffer buf (setq block1 hernes-ui--thinking-open-block))
+          (funcall on-thinking t)
+          (funcall on-thinking "second block reasoning")
+          (with-current-buffer buf (setq block2 hernes-ui--thinking-open-block))
+          (funcall on-thinking t)
+          (should (overlay-get (hernes-ui--thinking-block-overlay block1) 'invisible))
+          (should (overlay-get (hernes-ui--thinking-block-overlay block2) 'invisible))
+          (with-current-buffer buf
+            (goto-char (hernes-ui--thinking-block-header-start block1))
+            (hernes-ui-thinking-toggle))
+          (should-not (overlay-get (hernes-ui--thinking-block-overlay block1) 'invisible))
+          (should (overlay-get (hernes-ui--thinking-block-overlay block2) 'invisible)))
+      (kill-buffer buf))))
+
 (provide 'hernes-test)
 ;;; hernes-test.el ends here

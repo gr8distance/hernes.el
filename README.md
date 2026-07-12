@@ -58,6 +58,27 @@
 
 header-line に `[モード] モデル名  turns:N  (idle|running)` を表示する。
 
+### ストリーミングと thinking 表示
+
+リクエストは `:stream t` + `gptel-include-reasoning t` で送られる。ローカルの
+reasoning モデル（qwen3.5 等）は最初の数十秒を「思考」に費やすため、無音のままだと
+壊れて見える。これを避けるため、応答テキストは断片が届くたびにトランスクリプトへ
+ライブ追記され、モデルの thinking（reasoning）は dim な `hernes-ui-thinking-face` で
+その場表示される。**thinking は表示専用で会話コンテキストには積まれない**（次ターンには
+送らない）。加えて running 中は header-line の状態表示がスピナーグリフ + 経過秒
+（`⠋ running 12s`）に更新され、待ち時間が可視化される（idle になるとタイマは停止し、
+バッファ kill・中断時にも確実に解除される）。ストリーミングが有効にならない環境
+（curl 不在等）では、gptel が最終テキストを一括で返し、同じ経路が単一断片として
+描画するため二重表示は起きない。
+
+thinking の各ブロックは**折りたたみ可能**: ストリーミング中はヘッダ `▾ thinking` の下に
+本文がライブ表示され、reasoning が終わると既定（`hernes-ui-thinking-collapse-on-done`、
+既定 `t`）で `▸ thinking (Ns, M chars)`（経過秒・文字数）へ自動的に折りたたまれる。
+ヘッダ行の上で `TAB` / `RET` / マウス左クリックすると本文の表示・非表示を切り替えられる
+（本文は read-only のまま、overlay の `invisible` で隠すだけなので削除はされない）。
+1セッション中に複数回 thinking が出ても各ブロックは独立に開閉できる。
+`hernes-ui-thinking-collapse-on-done` を `nil` にすると、終了後も展開されたままになる。
+
 ### 入力行の特殊構文（Claude Code 互換）
 
 | 構文 | 動作 |
@@ -121,6 +142,8 @@ git に触れない）。プログラムから継続する場合は `(hernes-res
  :mode    'auto            ; 'chat / 'plan / 'auto
  :backend '(:endpoint "http://localhost:1234" :model "local-model")
  :on-turn (lambda (payload) ...)   ; ターン毎(省略時: buffer へ描画)
+ :on-stream (lambda (chunk) ...)   ; 応答テキスト断片毎(任意・UI用)
+ :on-thinking (lambda (chunk) ...) ; reasoning 断片毎 + 終端で t(任意・UI用)
  :on-done (lambda (result) (message "status: %s" (plist-get result :status))))
 ```
 
@@ -134,6 +157,9 @@ git に触れない）。プログラムから継続する場合は `(hernes-res
 - 外部トリガー（cron 等）からは `:buffer nil` + 独自 `:on-done` で直接呼べる。
 
 - `:on-turn` payload: `(:turn N :text ASSISTANT-TEXT :results (RESULT...))`
+- `:on-stream` 引数: 応答テキスト断片（文字列）。`:on-thinking` 引数: reasoning 断片
+  （文字列）、thinking ブロック終端で `t`。どちらも任意で UI 専用 —
+  省略（ヘッドレスの既定）すれば断片は捨てられ、reasoning は会話に一切残らない。
 - `:on-done` payload: `(:status done|stopped :reason STR :result STR :turns N :messages LIST)`
 
 `hernes-loop` 自体は git ブランチを作らない（副作用フリー）。`auto` の git 安全網が

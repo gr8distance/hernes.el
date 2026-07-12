@@ -56,6 +56,16 @@
   :type 'string
   :group 'hernes-ui)
 
+(defcustom hernes-ui-thinking-collapse-on-done t
+  "Whether a thinking block auto-collapses once its reasoning finishes.
+Non-nil (the default) hides the reasoning body as soon as `(reasoning . t)'
+closes the block, leaving only the `▸ thinking (Ns, M chars)' summary header;
+nil leaves it expanded until the human toggles it (TAB/RET/mouse-1 on the
+header line). Either way the block is always shown expanded while it is still
+streaming -- this only controls the state it lands in once done."
+  :type 'boolean
+  :group 'hernes-ui)
+
 (defface hernes-ui-user-face
   '((t :inherit font-lock-keyword-face :weight bold))
   "Face for the human's messages echoed into the transcript."
@@ -81,6 +91,17 @@
   "Face for turn/completion status lines."
   :group 'hernes-ui)
 
+(defface hernes-ui-thinking-face
+  '((t :inherit shadow :slant italic))
+  "Face for the model's live reasoning/thinking text.
+Deliberately dim: thinking is shown to prove the model is working, not as part
+of the answer, and it is never fed back into the conversation."
+  :group 'hernes-ui)
+
+(defconst hernes-ui--spinner-glyphs
+  ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"]
+  "Braille spinner frames cycled in the header line while a turn is running.")
+
 ;;;; Buffer-local state
 
 (defvar-local hernes-ui--session nil
@@ -104,6 +125,27 @@ Kept in sync with the session's mode via `hernes-set-mode' once one exists.")
 
 (defvar-local hernes-ui--running nil
   "Non-nil while a turn is in flight, for the header-line state.")
+
+(defvar-local hernes-ui--stream-active nil
+  "Non-nil while a live assistant text region is open in the transcript.
+Set when the first stream chunk of a turn is rendered, cleared when the turn's
+`on-turn'/`on-done' callback closes the region.  It tells those callbacks the
+assistant text is already on screen so they do not render it a second time.")
+
+(defvar-local hernes-ui--thinking-open-block nil
+  "The `hernes-ui--thinking-block' currently streaming, or nil when none is open.
+Set by `hernes-ui--open-thinking-block' on the first reasoning fragment of a
+turn and cleared by `hernes-ui--close-thinking' once `(reasoning . t)' arrives;
+see that section for the collapsible-header design.")
+
+(defvar-local hernes-ui--spinner-timer nil
+  "Repeating timer that refreshes the running header line, or nil when idle.")
+
+(defvar-local hernes-ui--spinner-start nil
+  "Time the current run started, for the header's elapsed-seconds counter.")
+
+(defvar-local hernes-ui--spinner-index 0
+  "Index into `hernes-ui--spinner-glyphs' for the current header frame.")
 
 (defvar-local hernes-ui--bang-running nil
   "Non-nil while a `!command' (see `hernes-ui--send-bang') is executing.
@@ -162,12 +204,25 @@ its tests exercise."
 ;;;; Header line
 
 (defun hernes-ui--header-string ()
-  "Return the header-line string: mode, model, turn count and idle/running."
+  "Return the header-line string: mode, model, turn count and idle/running.
+While running the state field shows a cycling spinner glyph and the seconds
+elapsed since the run started, so a long silent \"thinking\" phase still looks
+alive."
   (let* ((session hernes-ui--session)
          (backend (if session (hernes-session-backend session) hernes-backend))
          (model (or (plist-get backend :model) "?"))
          (turns (if session (hernes-session-turn session) 0))
-         (state (if hernes-ui--running "running" "idle")))
+         (state (if hernes-ui--running
+                    (let ((glyph (aref hernes-ui--spinner-glyphs
+                                       (mod hernes-ui--spinner-index
+                                            (length hernes-ui--spinner-glyphs))))
+                          (elapsed (if hernes-ui--spinner-start
+                                       (floor (float-time
+                                               (time-subtract (current-time)
+                                                              hernes-ui--spinner-start)))
+                                     0)))
+                      (format "%s running %ds" glyph elapsed))
+                  "idle")))
     (format " [%s] %s  turns:%d  (%s)" hernes-ui--mode model turns state)))
 
 (defun hernes-ui--update-header (buf)
@@ -177,14 +232,255 @@ its tests exercise."
       (setq header-line-format (hernes-ui--header-string))
       (force-mode-line-update))))
 
+(defun hernes-ui--start-spinner (buf)
+  "Start (or restart) BUF's running-header spinner timer.
+The timer captures BUF and cancels itself if BUF dies, so it cannot leak past
+the buffer's lifetime even if `hernes-ui--stop-spinner' is somehow missed."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (hernes-ui--stop-spinner buf)
+      (setq hernes-ui--spinner-start (current-time)
+            hernes-ui--spinner-index 0)
+      (let (timer)
+        (setq timer
+              (run-with-timer
+               0.2 0.2
+               (lambda ()
+                 (if (buffer-live-p buf)
+                     (with-current-buffer buf
+                       (if hernes-ui--running
+                           (progn (cl-incf hernes-ui--spinner-index)
+                                  (hernes-ui--update-header buf))
+                         (hernes-ui--stop-spinner buf)))
+                   (cancel-timer timer)))))
+        (setq hernes-ui--spinner-timer timer)))))
+
+(defun hernes-ui--stop-spinner (buf)
+  "Cancel BUF's spinner timer, if any."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (when (timerp hernes-ui--spinner-timer)
+        (cancel-timer hernes-ui--spinner-timer))
+      (setq hernes-ui--spinner-timer nil
+            hernes-ui--spinner-start nil))))
+
+(defun hernes-ui--cancel-spinner-on-kill ()
+  "Cancel this buffer's spinner timer.  Installed on `kill-buffer-hook'."
+  (when (timerp hernes-ui--spinner-timer)
+    (cancel-timer hernes-ui--spinner-timer)
+    (setq hernes-ui--spinner-timer nil)))
+
 (defun hernes-ui--set-running (buf flag)
-  "Set BUF's running FLAG and refresh its header line."
+  "Set BUF's running FLAG, drive the spinner timer, and refresh its header."
   (when (buffer-live-p buf)
     (with-current-buffer buf
       (setq hernes-ui--running flag)
+      (if flag
+          (hernes-ui--start-spinner buf)
+        (hernes-ui--stop-spinner buf))
       (hernes-ui--update-header buf))))
 
+;;;; Thinking blocks (collapsible reasoning, DESIGN.md §7.2)
+;;
+;; Each reasoning burst from the model becomes one independently toggleable
+;; block: a always-visible header line (`▾ thinking' while open, `▸ thinking
+;; (Ns, M chars)' while collapsed) followed by a body of dim-face text.  The
+;; header carries a `keymap' text property (TAB/RET/mouse-1 toggle) and a
+;; `hernes-ui-thinking-block' text property pointing at the block's struct, so
+;; the toggle commands below can find and mutate the right block regardless of
+;; how many others exist in the buffer.  The body's visibility is controlled
+;; by an overlay's `invisible' property -- the read-only text itself is never
+;; touched, only hidden/shown.
+
+(cl-defstruct (hernes-ui--thinking-block
+               (:constructor hernes-ui--make-thinking-block)
+               (:copier nil))
+  "State for one collapsible reasoning block in a hernes-ui transcript.
+Stored by reference as the `hernes-ui-thinking-block' text property on the
+block's header line, so toggling mutates the same object the streaming code
+created; each block's markers/overlay are independent of every other block's."
+  header-start   ; marker at the header line's first character (the glyph)
+  header-end     ; marker just past the header line's trailing newline
+  body-start     ; marker at the first character of the body (set at open)
+  overlay        ; invisibility overlay over the body, or nil until the block closes
+  start-time     ; `current-time' when the block opened, for the elapsed-time summary
+  elapsed        ; seconds spent reasoning, set by `hernes-ui--close-thinking'
+  char-count     ; body length in characters, set by `hernes-ui--close-thinking'
+  open)          ; non-nil while the body is visible
+
+(defvar hernes-ui--thinking-header-keymap
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "TAB") #'hernes-ui-thinking-toggle)
+    (define-key map (kbd "RET") #'hernes-ui-thinking-toggle)
+    (define-key map [mouse-1] #'hernes-ui-thinking-toggle-mouse)
+    map)
+  "Keymap active, via the `keymap' text property, on a thinking-block header
+line. TAB, RET and mouse-1 all toggle that block's body visibility. Being a
+text-property keymap rather than part of `hernes-ui-mode-map', it only takes
+effect with point on the header line and does not shadow those bindings
+(e.g. RET-to-send) anywhere else in the buffer.")
+
+(defun hernes-ui--thinking-header-glyph-text (block)
+  "Return BLOCK's header line text (sans trailing newline) for its current state."
+  (if (hernes-ui--thinking-block-open block)
+      "▾ thinking"
+    (format "▸ thinking (%ds, %d chars)"
+            (or (hernes-ui--thinking-block-elapsed block) 0)
+            (or (hernes-ui--thinking-block-char-count block) 0))))
+
+(defun hernes-ui--insert-thinking-header (text block)
+  "Insert TEXT (already newline-terminated) at point as BLOCK's header line.
+Read-only like ordinary transcript text (see `hernes-ui--ro-props'), but also
+carries `hernes-ui--thinking-header-keymap' and a `hernes-ui-thinking-block'
+property pointing at BLOCK, so a toggle command run from anywhere on this line
+finds the right block."
+  (let ((start (point)))
+    (insert (propertize text 'face 'hernes-ui-thinking-face))
+    (add-text-properties start (point)
+                          (append hernes-ui--ro-props
+                                  (list 'keymap hernes-ui--thinking-header-keymap
+                                        'hernes-ui-thinking-block block)))))
+
+(defun hernes-ui--render-thinking-header (block)
+  "Rewrite BLOCK's header line in place to match its current open/closed state.
+Deletes the old header text between its `header-start'/`header-end' markers
+and reinserts fresh text via `hernes-ui--insert-thinking-header', so the glyph
+and (once closed) the elapsed-time/char-count summary stay in sync. Editing
+this region shifts BLOCK's own `body-start' and any later block's markers
+forward/backward automatically (they are markers), so nothing else needs
+adjusting."
+  (let ((inhibit-read-only t)
+        (start (marker-position (hernes-ui--thinking-block-header-start block)))
+        (end (marker-position (hernes-ui--thinking-block-header-end block))))
+    (save-excursion
+      (delete-region start end)
+      (goto-char start)
+      (hernes-ui--insert-thinking-header
+       (concat (hernes-ui--thinking-header-glyph-text block) "\n") block)
+      (set-marker (hernes-ui--thinking-block-header-end block) (point)))))
+
+(defun hernes-ui--open-thinking-block (buf)
+  "Open a new collapsible thinking block in BUF and return it.
+Inserts a `▾ thinking' header at the transcript insertion point (see
+`hernes-ui--render'), then records `hernes-ui--thinking-open-block' so
+subsequent reasoning fragments (rendered the ordinary way, via
+`hernes-ui--render') land in the block's body and `hernes-ui--close-thinking'
+can finish it once `(reasoning . t)' arrives."
+  (with-current-buffer buf
+    (let ((inhibit-read-only t))
+      (goto-char hernes-ui--prompt-marker)
+      (let ((block (hernes-ui--make-thinking-block
+                    :header-start (copy-marker (point) nil)
+                    :start-time (current-time)
+                    :open t)))
+        (hernes-ui--insert-thinking-header "▾ thinking\n" block)
+        (setf (hernes-ui--thinking-block-header-end block) (copy-marker (point) nil))
+        (setf (hernes-ui--thinking-block-body-start block) (copy-marker (point) nil))
+        (setq hernes-ui--thinking-open-block block)
+        block))))
+
+(defun hernes-ui--toggle-thinking-block (block)
+  "Flip BLOCK's open/closed state and refresh its overlay and header.
+A no-op (with a message) while BLOCK is still streaming: it has no overlay
+yet (`hernes-ui--close-thinking' creates it), so there is nothing to hide
+until the reasoning text is complete."
+  (if (not (hernes-ui--thinking-block-overlay block))
+      (message "hernes: this thinking block is still streaming.")
+    (let ((open (not (hernes-ui--thinking-block-open block))))
+      (setf (hernes-ui--thinking-block-open block) open)
+      (overlay-put (hernes-ui--thinking-block-overlay block) 'invisible (not open))
+      (hernes-ui--render-thinking-header block))))
+
+(defun hernes-ui-thinking-toggle ()
+  "Toggle the thinking block at point (bound to TAB/RET on its header line)."
+  (interactive)
+  (let ((block (get-text-property (point) 'hernes-ui-thinking-block)))
+    (if block
+        (hernes-ui--toggle-thinking-block block)
+      (message "hernes: no thinking block at point."))))
+
+(defun hernes-ui-thinking-toggle-mouse (event)
+  "Toggle the thinking block clicked via mouse-1 EVENT.
+Uses the click position rather than `point' since a mouse command may run
+before point moves there."
+  (interactive "e")
+  (let* ((pos (posn-point (event-start event)))
+         (block (and pos (get-text-property pos 'hernes-ui-thinking-block))))
+    (if block
+        (hernes-ui--toggle-thinking-block block)
+      (message "hernes: no thinking block at point."))))
+
 ;;;; Session callbacks (render into the transcript)
+
+(defun hernes-ui--on-stream-fn (buf)
+  "Return an ON-STREAM callback appending each assistant CHUNK live into BUF.
+The first chunk of a turn opens a live assistant region (via
+`hernes-ui--stream-active'); subsequent chunks extend it.  The matching
+`on-turn'/`on-done' callback closes the region and, seeing it was streamed,
+skips re-rendering the same text (see `hernes-ui--close-stream')."
+  (lambda (chunk)
+    (when (and (buffer-live-p buf) (stringp chunk) (not (string-empty-p chunk)))
+      (with-current-buffer buf
+        (setq hernes-ui--stream-active t))
+      (hernes-ui--render buf chunk 'hernes-ui-assistant-face))))
+
+(defun hernes-ui--on-thinking-fn (buf)
+  "Return an ON-THINKING callback rendering reasoning live into BUF.
+A string PAYLOAD is a reasoning fragment streamed into the current thinking
+block's body (opening a new collapsible block, see
+`hernes-ui--open-thinking-block', on the first fragment of a turn); PAYLOAD t
+closes the block via `hernes-ui--close-thinking'.  Reasoning is display-only
+and is never part of the conversation the model sees on later turns."
+  (lambda (payload)
+    (when (buffer-live-p buf)
+      (cond
+       ((and (stringp payload) (not (string-empty-p payload)))
+        (with-current-buffer buf
+          (unless hernes-ui--thinking-open-block
+            (hernes-ui--open-thinking-block buf)))
+        (hernes-ui--render buf payload 'hernes-ui-thinking-face))
+       ((eq payload t)
+        (hernes-ui--close-thinking buf))))))
+
+(defun hernes-ui--close-thinking (buf)
+  "Close BUF's open thinking block, if any.
+Measures elapsed time and body character count, wraps the body in an
+invisibility overlay, applies the initial open/closed state from
+`hernes-ui-thinking-collapse-on-done', and rewrites the header line (via
+`hernes-ui--render-thinking-header') to show either the still-open glyph or
+the collapsed summary."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (when hernes-ui--thinking-open-block
+        (let* ((block hernes-ui--thinking-open-block)
+               (body-start (marker-position (hernes-ui--thinking-block-body-start block)))
+               (body-end (marker-position hernes-ui--prompt-marker))
+               (elapsed (round (float-time
+                                (time-subtract (current-time)
+                                               (hernes-ui--thinking-block-start-time block)))))
+               (char-count (max 0 (- body-end body-start)))
+               (overlay (make-overlay body-start body-end)))
+          (setf (hernes-ui--thinking-block-overlay block) overlay
+                (hernes-ui--thinking-block-elapsed block) elapsed
+                (hernes-ui--thinking-block-char-count block) char-count
+                (hernes-ui--thinking-block-open block) (not hernes-ui-thinking-collapse-on-done))
+          (overlay-put overlay 'invisible (not (hernes-ui--thinking-block-open block)))
+          (overlay-put overlay 'hernes-ui-thinking-body block)
+          (hernes-ui--render-thinking-header block)
+          (setq hernes-ui--thinking-open-block nil)
+          (hernes-ui--render buf "\n\n" 'hernes-ui-thinking-face))))))
+
+(defun hernes-ui--close-stream (buf)
+  "Close BUF's live assistant stream region, returning non-nil if one was open.
+When a region was open the streamed text is already on screen, so the caller
+must NOT render the turn/final text again -- it just terminates the region with
+a blank line."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (when hernes-ui--stream-active
+        (setq hernes-ui--stream-active nil)
+        (hernes-ui--render buf "\n\n" 'hernes-ui-assistant-face)
+        t))))
 
 (defun hernes-ui--on-turn-fn (buf)
   "Return an ON-TURN callback that renders a turn's output into BUF."
@@ -192,9 +488,13 @@ its tests exercise."
     (when (buffer-live-p buf)
       (let ((text (plist-get payload :text))
             (results (plist-get payload :results)))
-        (when (and (stringp text) (not (string-empty-p (string-trim text))))
-          (hernes-ui--render buf (format "%s\n\n" (string-trim text))
-                             'hernes-ui-assistant-face))
+        (hernes-ui--close-thinking buf)
+        ;; If the assistant text streamed in live, close that region instead of
+        ;; drawing it again; otherwise (streaming disabled) render it once here.
+        (unless (hernes-ui--close-stream buf)
+          (when (and (stringp text) (not (string-empty-p (string-trim text))))
+            (hernes-ui--render buf (format "%s\n\n" (string-trim text))
+                               'hernes-ui-assistant-face)))
         (dolist (r results)
           (hernes-ui--render
            buf
@@ -212,10 +512,14 @@ its tests exercise."
     (when (buffer-live-p buf)
       (let ((status (plist-get payload :status))
             (result (plist-get payload :result)))
-        (when (and (eq status 'done) (stringp result)
-                   (not (string-empty-p (string-trim result))))
-          (hernes-ui--render buf (format "%s\n\n" (string-trim result))
-                             'hernes-ui-assistant-face))
+        (hernes-ui--close-thinking buf)
+        ;; Same double-render guard as on-turn: a text-only final turn streams
+        ;; its answer with no on-turn call, so the region is still open here.
+        (unless (hernes-ui--close-stream buf)
+          (when (and (eq status 'done) (stringp result)
+                     (not (string-empty-p (string-trim result))))
+            (hernes-ui--render buf (format "%s\n\n" (string-trim result))
+                               'hernes-ui-assistant-face)))
         (hernes-ui--render buf
                            (format "── %s: %s (turns: %s) ──\n\n"
                                    status
@@ -274,7 +578,9 @@ Two input constructs are special-cased ahead of the ordinary LLM-message path
                    :id hernes-ui--id
                    :buffer buf
                    :on-turn (hernes-ui--on-turn-fn buf)
-                   :on-done (hernes-ui--on-done-fn buf))))
+                   :on-done (hernes-ui--on-done-fn buf)
+                   :on-stream (hernes-ui--on-stream-fn buf)
+                   :on-thinking (hernes-ui--on-thinking-fn buf))))
     (setq hernes-ui--session session)
     (hernes-ui--set-running buf t)
     (hernes--ensure-git
@@ -517,7 +823,9 @@ completed via `hernes-ui--capf' (a standard capf, so Corfu/Orderless pick it
 up with no extra wiring)."
   (setq-local truncate-lines nil)
   (visual-line-mode 1)
-  (add-hook 'completion-at-point-functions #'hernes-ui--capf nil t))
+  (add-hook 'completion-at-point-functions #'hernes-ui--capf nil t)
+  ;; Guarantee the running-header timer never outlives the buffer.
+  (add-hook 'kill-buffer-hook #'hernes-ui--cancel-spinner-on-kill nil t))
 
 ;;;; Buffer setup / entry point
 

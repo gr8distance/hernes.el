@@ -155,6 +155,7 @@ the mode changes the model's instructions on the very next turn."
   system backend
   buffer                                ;control buffer
   on-turn on-done
+  on-stream on-thinking                 ;live streaming / reasoning display (UI only)
   (pending-text "")                     ;assistant text captured this turn
   (error-streak nil)                    ;(TOOL-NAME . COUNT) of consecutive errors
   (processes nil)                       ;live subprocesses, for abort
@@ -550,7 +551,11 @@ send and on the next tool dispatch."
       :host host
       :protocol protocol
       :endpoint "/v1/chat/completions"
-      :stream nil
+      ;; Streaming must be enabled on the backend struct itself: gptel gates
+      ;; streaming on (gptel-backend-stream gptel-backend) in addition to the
+      ;; per-request :stream flag, so `:stream nil' here would silently disable
+      ;; the token/thinking stream even when the request asks for it.
+      :stream t
       :key "no-key"
       :models (list (list (intern model) :capabilities '(tool))))))
 
@@ -606,6 +611,13 @@ the current buffer instead (gptel never receives a nil :buffer)."
             (gptel-model (intern (or (plist-get (hernes-session-backend session) :model)
                                      "local-model")))
             (gptel-use-tools t)
+            ;; Ask the backend to emit the model's reasoning/thinking as
+            ;; (reasoning . CHUNK) callbacks so the UI can show it live.  Unlike
+            ;; `gptel-confirm-tool-calls', this variable IS read synchronously
+            ;; while `gptel-request' builds the payload, so the let binding
+            ;; applies.  hernes never stores reasoning in the conversation (see
+            ;; `hernes--turn-callback'), so it does not pollute later turns.
+            (gptel-include-reasoning t)
             ;; Interception relies on each tool's :confirm slot (see
             ;; `hernes--tool->gptel'), NOT on binding `gptel-confirm-tool-calls'
             ;; here: gptel reads that variable asynchronously after this let
@@ -614,23 +626,41 @@ the current buffer instead (gptel never receives a nil :buffer)."
         (gptel-request (hernes-session-messages session)
           :system (hernes--effective-system session)
           :buffer buffer
-          :stream nil
+          ;; Stream so a reasoning model's long "thinking" phase produces visible
+          ;; output instead of dead air.  Text chunks arrive incrementally and
+          ;; are concatenated in `hernes--turn-callback'; if streaming does not
+          ;; engage (e.g. no curl) gptel delivers one final string, which the
+          ;; same concatenation handles as a single chunk.
+          :stream t
           :context session
           :fsm (hernes--make-fsm)
           :callback (lambda (response info)
                       (hernes--turn-callback session response info)))))))
 
 (defun hernes--turn-callback (session response _info)
-  "gptel callback for SESSION.  RESPONSE is as in `gptel-request'."
+  "gptel callback for SESSION.  RESPONSE is as in `gptel-request'.
+Under streaming RESPONSE arrives in pieces: assistant text chunks (strings),
+reasoning chunks (\\=(reasoning . CHUNK)) with a (reasoning . t) terminator, tool
+calls (\\=(tool-call . PENDING)), and a final t on success.  Whether the turn
+ends is still decided by the tool-call branch or the FSM terminal handler."
   (cond
    ((hernes-session-aborted session) nil)
    ((stringp response)
-    ;; Assistant text.  Store it; whether this ends the turn is decided by the
-    ;; tool-call callback or the FSM terminal handler.
-    (setf (hernes-session-pending-text session) response))
+    ;; Assistant text.  CONCATENATE (streaming delivers fragments); a
+    ;; non-streamed reply is simply a single fragment appended to the empty
+    ;; pending-text that `hernes--run-turn' set at the start of the turn.
+    (setf (hernes-session-pending-text session)
+          (concat (hernes-session-pending-text session) response))
+    (hernes--notify-stream session response))
+   ((and (consp response) (eq (car response) 'reasoning))
+    ;; Thinking: shown live only.  Deliberately NOT concatenated into
+    ;; pending-text and NEVER pushed as a message, so it never re-enters the
+    ;; context on later turns.  CHUNK is a string fragment, or t at block end.
+    (hernes--notify-thinking session (cdr response)))
    ((and (consp response) (eq (car response) 'tool-call))
     (hernes--handle-tool-calls session (cdr response)))
-   ;; reasoning blocks, nil (pure tool call, no text), abort: nothing to do here.
+   ;; final t (stream success), abort symbol, nil (pure tool call, no text):
+   ;; nothing to do here.
    (t nil)))
 
 (defun hernes--handle-tool-calls (session pending)
@@ -712,6 +742,22 @@ even if the model asks for it."
                      :text (hernes-session-pending-text session)
                      :results results)))))
 
+(defun hernes--notify-stream (session chunk)
+  "Call SESSION's on-stream hook, if any, with an assistant text CHUNK.
+Headless-safe: with no on-stream callback (the default, as under `emacs
+--batch') this is a no-op."
+  (when (functionp (hernes-session-on-stream session))
+    (with-demoted-errors "hernes on-stream error: %S"
+      (funcall (hernes-session-on-stream session) chunk))))
+
+(defun hernes--notify-thinking (session chunk)
+  "Call SESSION's on-thinking hook, if any, with a reasoning CHUNK.
+CHUNK is a string fragment or t (end of the thinking block).  Headless-safe:
+with no on-thinking callback this is a no-op, so reasoning is simply dropped."
+  (when (functionp (hernes-session-on-thinking session))
+    (with-demoted-errors "hernes on-thinking error: %S"
+      (funcall (hernes-session-on-thinking session) chunk))))
+
 (defun hernes--finish (session status reason)
   "Mark SESSION finished with STATUS and REASON and call on-done once.
 The loop keeps no buffer of its own here; any user-visible output is the
@@ -756,7 +802,7 @@ buffer).  This is what lets the loop run headless."
 
 ;;;###autoload
 (cl-defun hernes-loop (&key task system-prompt tools backend mode max-turns
-                            on-turn on-done buffer root id)
+                            on-turn on-done on-stream on-thinking buffer root id)
   "Run an autonomous agent loop and return its `hernes-session'.
 
 This is the re-entrant core: all state lives in the returned session struct, so
@@ -788,23 +834,36 @@ Keyword arguments:
                  (:turn :text :results).  Overrides the default buffer renderer.
   ON-DONE        called once at completion, with a result plist
                  (:status :reason :result :turns :messages).  Overrides the
-                 default buffer renderer."
+                 default buffer renderer.
+  ON-STREAM      called with each assistant text CHUNK (a string) as it streams
+                 in.  Optional and UI-only: omit it (the default) for headless
+                 runs, where streamed chunks are simply dropped.
+  ON-THINKING    called with each reasoning CHUNK (a string), and with t at the
+                 end of the thinking block.  Optional and UI-only in the same
+                 way; reasoning is never added to the conversation."
   (let ((session (hernes--init-session
                   :task task :system-prompt system-prompt :tools tools
                   :backend backend :mode mode :max-turns max-turns
-                  :on-turn on-turn :on-done on-done :buffer buffer :root root :id id)))
+                  :on-turn on-turn :on-done on-done
+                  :on-stream on-stream :on-thinking on-thinking
+                  :buffer buffer :root root :id id)))
     (hernes--run-turn session)
     session))
 
 (cl-defun hernes--init-session (&key task system-prompt tools backend mode max-turns
-                                     on-turn on-done buffer root id)
+                                     on-turn on-done on-stream on-thinking buffer root id)
   "Build and return a fresh `hernes-session' WITHOUT starting its turn loop.
 This is the constructor half of `hernes-loop': it validates nothing new, stores
 the UNFILTERED candidate tools (the mode filter is applied per send), installs
 the default buffer renderers only when BUFFER is live and no callback was
 supplied, records the opening prompt, and returns.  Callers that need to gate
 the first turn (e.g. the UI running `hernes--ensure-git' for `auto' mode) use
-this plus `hernes--run-turn' instead of `hernes-loop'; see DESIGN.md section 1."
+this plus `hernes--run-turn' instead of `hernes-loop'; see DESIGN.md section 1.
+
+ON-STREAM and ON-THINKING (the live token/reasoning display) are stored as
+given, with no default buffer renderer installed: they are a UI concern that
+only hernes-ui.el wires up, and a nil callback keeps the core headless-safe (see
+`hernes--notify-stream' / `hernes--notify-thinking')."
   (let* ((mode (or mode 'auto))
          (buffer-live (buffer-live-p buffer))
          ;; The default control-buffer chrome (banner + renderers) is only for
@@ -826,7 +885,9 @@ this plus `hernes--run-turn' instead of `hernes-loop'; see DESIGN.md section 1."
                    :backend (or backend hernes-backend)
                    :buffer buffer
                    :on-turn on-turn
-                   :on-done on-done)))
+                   :on-done on-done
+                   :on-stream on-stream
+                   :on-thinking on-thinking)))
     ;; The only buffer touch in the core, and it is guarded: headless runs skip it.
     (when buffer-live
       (with-current-buffer buffer (setq-local hernes--session session)))

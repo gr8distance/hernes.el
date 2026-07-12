@@ -159,6 +159,25 @@ macher 系のエディット単位承認は不採用(委任に向かない)。
   添付後ミニバッファで指示を入力 → 即送信。
 - 複数回 attach で積み上げ可 (送信時にまとめて同梱、送信後クリア)。
 
+### 7.2 ストリーミングと thinking 表示 (P-A.5)
+
+ローカル reasoning モデル(qwen3.5 等)は最初の数十秒を thinking に費やすため、
+`:stream nil` + reasoning 非表示だと「無音 = 壊れて見える」。対策:
+
+- `hernes--send-request` を `:stream t` + `gptel-include-reasoning t` に。
+- コールバックの拡張:
+  - `(reasoning . CHUNK)` → UI の **thinking 領域**にライブ追記(dim face、`hernes-ui-thinking-face`)。
+    `(reasoning . t)` で thinking ブロックを閉じる。thinking はコンテキストに積まない
+    (その場表示のみ、次ターンには送らない)
+  - 文字列チャンク → `pending-text` に**連結**(現状は置換なので蓄積に変更)。UI にライブ追記
+  - `(tool-call . _)` は現行どおり(ストリーミングでも tool call は届く)
+- header に**経過秒スピナー**(running 中 `run-with-timer` で更新、堅牢なフォールバック)。
+- headless(buffer なし)では thinking チャンクは捨てる(コアはUI非依存を維持)。
+- **thinking の開閉**: 各 reasoning ブロックはトグル付きヘッダ(`▾ thinking` 開 / `▸ thinking
+  (経過s, 字数)` 閉)を持つ。ストリーミング中は開いて表示、`(reasoning . t)` 到達で
+  既定は自動折りたたみ(defcustom `hernes-ui-thinking-collapse-on-done`)。ヘッダ上で
+  TAB/RET/mouse-1 でトグル。本文は overlay の invisible 制御で隠す(read-only 挿入と両立)。
+
 ## 8. 実装フェーズ
 
 - **P-A**: hernes-loop + fs/exec/git ツール + `auto`/`chat` モード + 制御バッファ + 常時安全網の基礎
